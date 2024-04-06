@@ -1,5 +1,8 @@
 import * as vscode from 'vscode';
-import { parse, walk, TestContext } from 'python-ast';
+import { parse, walk } from 'python-ast';
+import { ErrorNode } from 'antlr4ts/tree/ErrorNode';
+
+type CallbackFn = (text: string, controlName: string, indentation: string, defaultIndentation: string, textComma: string, endComma: string) => string;
 
 function getDefaultIndentation(editor: vscode.TextEditor) {
     const { insertSpaces, tabSize } = editor.options;
@@ -9,13 +12,61 @@ function getDefaultIndentation(editor: vscode.TextEditor) {
 function getIndentationOfSelection(editor: vscode.TextEditor): string {
     const selection = editor.selection;
     const firstLineOfSelection = editor.document.lineAt(selection.start.line).text;
-    
+
     const match = firstLineOfSelection.match(/^(\s*)/);
     return match ? match[1] as string : '';
 }
 
-function getObjectRange(selection: vscode.Selection, document: vscode.TextDocument) {
-    let text = document.getText();
+function checkText(text: string) {
+    const ast = parse(text);
+    let argumentDepth: number | undefined;
+    let correctText = true;
+    let nodeCount = 0;
+
+    walk({
+        enterAtom_expr: (ctx) => {
+            if (!argumentDepth) {
+                argumentDepth = ctx.depth();
+            } else if (ctx.depth() !== argumentDepth) {
+                return;
+            }
+            if (ctx.childCount === 1) {
+                correctText = false;
+            }
+            if (ctx.childCount === 2) {
+                const lastChild: any = ctx.children![1];
+                const lastChildNode = lastChild.children[lastChild.childCount - 1];
+                if (lastChildNode.text === '(') {
+                    correctText = false;
+                }
+                if (lastChildNode instanceof ErrorNode) {
+                    correctText = false;
+                }
+            }
+            nodeCount++;
+        },
+    }, ast);
+
+    return {
+        nodeCount,
+        correctText,
+    };
+}
+
+function getObjectRange(selection: vscode.Selection, document: vscode.TextDocument): vscode.Range | undefined {
+    let text = document.getText(selection);
+    if (text !== '') {
+        const { nodeCount, correctText } = checkText(text);
+        if (nodeCount > 1) {
+            if (!correctText) {
+                return;
+            } else {
+                return new vscode.Range(selection.start, selection.end);
+            }
+        }
+    }
+
+    text = document.getText();
     let wordRange = document.getWordRangeAtPosition(selection.start, /[\w\._]+ *\(/);
 
     if (!wordRange) {
@@ -58,10 +109,10 @@ function getObjectRange(selection: vscode.Selection, document: vscode.TextDocume
 }
 
 function wrapWith(
-    controlName: string = "control", 
-    callbackfn?: (text: string, controlName: string, indentation: string, defaultIndentation: string) => string
+    controlName: string = "control",
+    callbackfn?: CallbackFn,
 ) {
-	const editor = vscode.window.activeTextEditor;
+    const editor = vscode.window.activeTextEditor;
 
     if (!editor) {
         return;
@@ -70,18 +121,20 @@ function wrapWith(
     if (!callbackfn) {
         return;
     }
-    
+
     const objectRange = getObjectRange(editor.selection, editor.document);
     if (!objectRange) {
         return;
     }
     const selection = new vscode.Selection(objectRange.start, objectRange.end);
-    
+
     const defaultIndentation = getDefaultIndentation(editor);
     const indentation = getIndentationOfSelection(editor);
     const text = editor.document.getText(selection);
+    const textComma = text.endsWith(',') ? '' : ',';
+    const endComma = textComma ? '' : ',';
 
-    const wrappedText = callbackfn(text, controlName, indentation, defaultIndentation);
+    const wrappedText = callbackfn(text, controlName, indentation, defaultIndentation, textComma, endComma);
 
     editor.edit(editBuilder => {
         editBuilder.replace(selection, wrappedText);
@@ -98,42 +151,31 @@ function wrapWith(
 function wrapWithContent() {
     return wrapWith(
         "Control",
-        (text, controlName, indentation, defaultIndentation) => 
-            `${controlName}(` +
-            `\n${indentation}${defaultIndentation}content=${text.replace(/\n/g, `\n${defaultIndentation}`)},` +
-            `\n${indentation})`
+        (text, controlName, indentation, defaultIndentation, textComma, endComma) => {
+            return `${controlName}(` +
+                `\n${indentation}${defaultIndentation}content=${text.replace(/\n/g, `\n${defaultIndentation}`)}${textComma}` +
+                `\n${indentation})${endComma}`;
+        },
     );
 }
 
 function wrapWithControls() {
     return wrapWith(
         "Control",
-        (text, controlName, indentation, defaultIndentation) => `${controlName}(` +
-            `\n${indentation}${defaultIndentation}controls=[` +
-            `\n${indentation}${defaultIndentation.repeat(2)}${text.replace(/\n/g, `\n${defaultIndentation.repeat(2)}`)},` +
-            `\n${indentation}${defaultIndentation}]` +
-            `\n${indentation})`
+        (text, controlName, indentation, defaultIndentation, textComma, endComma) => {
+            return `${controlName}(` +
+                `\n${indentation}${defaultIndentation}controls=[` +
+                `\n${indentation}${defaultIndentation.repeat(2)}${text.replace(/\n/g, `\n${defaultIndentation.repeat(2)}`)}${textComma}` +
+                `\n${indentation}${defaultIndentation}]` +
+                `\n${indentation})${endComma}`;
+        },
     );
 }
 
-function unwrapControl() {
-    const editor = vscode.window.activeTextEditor;
-
-    if (!editor) {
-        vscode.window.showInformationMessage('No editor is active');
-        return;
-    }
-    
-    const objectRange = getObjectRange(editor.selection, editor.document);
-    if (!objectRange) {
-        return;
-    }
-
-    const selection = new vscode.Selection(objectRange.start, objectRange.end);
-    const text = editor.document.getText(selection);
+function getContentStartIndex(text: string) {
     const ast = parse(text);
-
-    let defaultIndentation = getDefaultIndentation(editor);
+    let isContent = false;
+    let isControls = false;
     let argumentDepth: number | undefined;
     let contentStartIndex: number | undefined;
 
@@ -148,10 +190,12 @@ function unwrapControl() {
                 return;
             }
             if (ctx.children[0].text === "content" && !contentStartIndex) {
+                isContent = true;
                 const contentNode: any = ctx.children[2];
                 contentStartIndex = contentNode.start.startIndex;
             }
             if (ctx.children[0].text === "controls" && !contentStartIndex) {
+                isControls = true;
                 const controlsNode: any = ctx.children[2];
                 walk({
                     enterTestlist_comp: (ctx) => {
@@ -162,7 +206,6 @@ function unwrapControl() {
                             return;
                         }
                         if (!contentStartIndex) {
-                            defaultIndentation += defaultIndentation;
                             contentStartIndex = ctx.start.startIndex;
                         }
                     }
@@ -171,9 +214,35 @@ function unwrapControl() {
         }
     }, ast);
 
-    if (!contentStartIndex) {
-        vscode.window.showInformationMessage('Cannot find the content.');
+    return { contentStartIndex, isContent, isControls };
+}
+
+function unwrapControl() {
+    const editor = vscode.window.activeTextEditor;
+
+    if (!editor) {
+        vscode.window.showInformationMessage('No editor is active');
         return;
+    }
+
+    const objectRange = getObjectRange(editor.selection, editor.document);
+    if (!objectRange) {
+        return;
+    }
+
+    const selection = new vscode.Selection(objectRange.start, objectRange.end);
+    const text = editor.document.getText(selection);
+
+    let defaultIndentation = getDefaultIndentation(editor);
+    
+    const { contentStartIndex, isContent, isControls } = getContentStartIndex(text);
+    
+    if (contentStartIndex === undefined) {
+        return;
+    }
+
+    if (isControls) {
+        defaultIndentation += defaultIndentation;
     }
 
     const contentStartOffset = editor.document.offsetAt(objectRange.start) + contentStartIndex;
@@ -195,7 +264,7 @@ function unwrapControl() {
 
 export class WrapActionProvider implements vscode.CodeActionProvider {
     public provideCodeActions(document: vscode.TextDocument, range: vscode.Range | vscode.Selection): vscode.ProviderResult<vscode.CodeAction[]> {
-        
+
         let selection: vscode.Selection;
         if (range instanceof vscode.Range) {
             selection = new vscode.Selection(range.start, range.end);
@@ -208,8 +277,12 @@ export class WrapActionProvider implements vscode.CodeActionProvider {
             return;
         }
 
+        const text = document.getText(objectRange);
+        const { nodeCount } = checkText(text);
+        const { contentStartIndex } = getContentStartIndex(text);
+
         return [
-            {
+            nodeCount === 1 && {
                 command: {
                     title: 'Wrap in content',
                     command: 'flet.refactor.wrap.content',
@@ -218,14 +291,14 @@ export class WrapActionProvider implements vscode.CodeActionProvider {
                 kind: vscode.CodeActionKind.Refactor,
             },
             {
-                command: {
+                command: { 
                     title: 'Wrap in controls',
                     command: 'flet.refactor.wrap.controls',
                 },
                 title: 'Wrap in controls',
                 kind: vscode.CodeActionKind.Refactor,
             },
-            {
+            (nodeCount === 1 && contentStartIndex !== undefined) && {
                 command: {
                     title: 'Remove wrapper',
                     command: 'flet.refactor.unwrap',
@@ -233,13 +306,13 @@ export class WrapActionProvider implements vscode.CodeActionProvider {
                 title: 'Remove wrapper',
                 kind: vscode.CodeActionKind.Refactor,
             },
-        ];
+        ].filter(Boolean) as vscode.ProviderResult<vscode.CodeAction[]>;
     }
 }
 
 export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(vscode.languages.registerCodeActionsProvider(
-        "python", 
+        "python",
         new WrapActionProvider(),
         { providedCodeActionKinds: [vscode.CodeActionKind.Refactor] }
     ));
@@ -251,4 +324,4 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('flet.refactor.unwrap', unwrapControl);
 }
 
-export function deactivate() {}
+export function deactivate() { }
