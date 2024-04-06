@@ -16,7 +16,7 @@
   ],
   "repository": {
 		"type": "git",
-		"url": "https://github.com/amir9480/vscode-flutter-widget-wrap"
+		"url": "https://github.com/50Bytes-dev/vscode-flet-wrap"
 	},
   "main": "./out/extension.js",
   "contributes": {},
