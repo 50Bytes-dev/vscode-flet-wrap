@@ -16,5 +16,7 @@ To streamline your Flet UI development:
 [VSCode Marketplace Page](https://marketplace.visualstudio.com/items?itemName=sobytes.flet-control-wrap)
 
 ## What's New
+### Version 0.0.2
+- **Add multiple wrap**: Support select multiple controls for wrap in `controls`.
 ### Version 0.0.1
 - **Initial Release**: First version of the Flet Control Wrapper, designed to simplify your Flet UI coding tasks in Visual Studio Code.
